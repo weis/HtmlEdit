@@ -162,6 +162,167 @@ Sanitization policy:
   - `?rteDebug` or `?debug=1` or `?debug=true`
   - Enables verbose logs (`editor.debug = true`) and an on-page HUD for counts of `input`, `change`, and `selection-change` events (exposes `window.__rteHud.reset()`).
 
+## Lit Integration Notes
+
+The editor is implemented as a Lit web component and is designed to be embedded in Lit apps seamlessly.
+
+### Component patterns used
+
+- Base class: `LitElement` with decorators from `lit/decorators.js`.
+- Reactive inputs via `@property`:
+  - `value: string`, `placeholder: string`, `disabled: boolean`, `paste-mode: 'prompt'|'html'|'text'`, `sanitize-paste: boolean`, `toolbar-visible: boolean`, `debug: boolean`.
+- Internal UI state via `@state` for flags like bold/italic, color popover open, last paste choice, etc.
+- Styles: imported `editorStyles` applied via `static styles = editorStyles;` (scoped to shadow DOM).
+- Lifecycle hooks:
+  - `firstUpdated`: wires DnD + hidden file input, loads paste prefs, initializes ProseMirror.
+  - `updated`: synchronizes external `value` → PM document; updates disabled state.
+  - `disconnectedCallback`: cleans up and tears down PM to avoid leaks.
+- Rendering: `render()` returns the toolbar template + a single `.content` div host for the PM view. Only `@paste` is handled on the host; PM manages contenteditable internally.
+- Events: emits `input` (per PM doc change), `change` (debounced), and `selection-change` (throttled) as CustomEvents from the component.
+
+### Using inside a Lit parent component
+
+```ts
+import { LitElement, html } from 'lit';
+import { customElement, state, query } from 'lit/decorators.js';
+import './components/rich-text-editor.ts';
+
+@customElement('demo-host')
+export class DemoHost extends LitElement {
+  @state() private content = '<p>Hello <strong>world</strong>!</p>';
+  @state() private disabled = false;
+  @query('demo-rich-text-editor') private rte!: any; // access methods like exec/getHTML/setHTML
+
+  render() {
+    return html`
+      <button @click=${() => this.disabled = !this.disabled}>
+        ${this.disabled ? 'Enable' : 'Disable'}
+      </button>
+      <demo-rich-text-editor
+        .value=${this.content}
+        .disabled=${this.disabled}
+        placeholder="Write something…"
+        paste-mode="prompt"
+        sanitize-paste
+        @input=${(e: CustomEvent<{html:string}>) => { this.content = e.detail.html; }}
+        @selection-change=${(e: CustomEvent<{from:number;to:number;empty:boolean}>) => console.log('sel', e.detail)}
+      ></demo-rich-text-editor>
+
+      <div style="margin-top:8px;">
+        <button @click=${() => this.rte.exec('bold')}>Bold</button>
+        <button @click=${() => this.rte.exec('setAlign','center')}>Center</button>
+        <button @click=${() => this.rte.setHTML('<p>Programmatic</p>')}>Set HTML</button>
+        <button @click=${() => console.log(this.rte.getHTML())}>Log HTML</button>
+      </div>
+    `;
+  }
+}
+```
+
+Notes:
+- Bind properties with `.` (e.g., `.value=${...}`, `.disabled=${...}`) for reactive updates.
+- Listen to `input` for immediate content changes and `change` for debounced updates.
+- Use `@query` or a `createRef`/`@ref` pattern to call imperative methods like `exec`, `getHTML`, and `setHTML`.
+- Because the editor renders in shadow DOM, outer page CSS does not affect its internal content; customize via attributes/props or fork `editorStyles`.
+
+### Lit controller / directive integration
+
+Sometimes it’s convenient to encapsulate wiring to the editor inside a Lit ReactiveController or a small directive.
+
+ReactiveController example (tracks selection + html):
+
+```ts
+import type { ReactiveController, ReactiveControllerHost } from 'lit';
+
+type RteEl = HTMLElement & {
+  addEventListener: HTMLElement['addEventListener'];
+  removeEventListener: HTMLElement['removeEventListener'];
+  getHTML(): string;
+  exec(cmd: string, value?: string): void;
+};
+
+export class RteController implements ReactiveController {
+  private host: ReactiveControllerHost;
+  editor?: RteEl;
+  selection = { from: 0, to: 0, empty: true };
+  html = '';
+  constructor(host: ReactiveControllerHost, editor?: RteEl) {
+    this.host = host;
+    host.addController(this);
+    if (editor) this.attach(editor);
+  }
+  attach(editor: RteEl) {
+    this.detach();
+    this.editor = editor;
+    editor.addEventListener('input', this.onInput);
+    editor.addEventListener('selection-change', this.onSel);
+    // initialize
+    this.html = editor.getHTML?.() ?? '';
+    this.host.requestUpdate();
+  }
+  detach() {
+    if (!this.editor) return;
+    this.editor.removeEventListener('input', this.onInput);
+    this.editor.removeEventListener('selection-change', this.onSel);
+    this.editor = undefined;
+  }
+  hostDisconnected() { this.detach(); }
+  private onInput = (e: Event) => {
+    const { html } = (e as CustomEvent<{ html: string }>).detail || { html: '' };
+    this.html = html;
+    this.host.requestUpdate();
+  };
+  private onSel = (e: Event) => {
+    const d = (e as CustomEvent<{ from:number; to:number; empty:boolean }>).detail;
+    if (d) this.selection = d;
+    this.host.requestUpdate();
+  };
+}
+
+// Usage in a Lit host
+import { LitElement, html } from 'lit';
+import { customElement, query } from 'lit/decorators.js';
+import './components/rich-text-editor.ts';
+
+@customElement('demo-ctrl-host')
+export class DemoCtrlHost extends LitElement {
+  @query('demo-rich-text-editor') el?: RteEl;
+  rte = new RteController(this);
+  firstUpdated() { if (this.el) this.rte.attach(this.el); }
+  render() {
+    const { from, to, empty } = this.rte.selection;
+    return html`
+      <demo-rich-text-editor .value=${this.rte.html}></demo-rich-text-editor>
+      <div>sel: ${from}-${to} (empty: ${String(empty)})</div>
+    `;
+  }
+}
+```
+
+Minimal directive to run setup logic once on the element:
+
+```ts
+import { directive, Directive, PartType } from 'lit/directive.js';
+
+class RteSetupDirective extends Directive {
+  constructor(partInfo: any) {
+    super(partInfo);
+    if (partInfo.type !== PartType.ELEMENT) throw new Error('Use on element');
+  }
+  render(setup: (el: HTMLElement) => void) { return null; }
+  update(part: any, [setup]: [(el: HTMLElement) => void]) {
+    const el = part.element as HTMLElement;
+    setup?.(el);
+    return null;
+  }
+}
+
+export const rteSetup = directive(RteSetupDirective);
+
+// Usage in template
+// html`<demo-rich-text-editor ${rteSetup((el) => ctrl.attach(el as RteEl))}></demo-rich-text-editor>`
+```
+
 ## Setup & Installation
 
 Prerequisites:
