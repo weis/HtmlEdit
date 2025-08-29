@@ -1,0 +1,20 @@
+{
+  "name": "HtmlEdit",
+  "version": "1.0.0",
+  "description": "",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc -w",
+    "preview": "npm run build && node server.cjs",
+    "start": "node server.cjs"
+    ,"test": "npm run build && node test/paste.test.js && node test/commands.test.js"
+  },
+  "dependencies": {
+    "lit": "^3.3.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.3"
+  },
+  "private": true
+}
