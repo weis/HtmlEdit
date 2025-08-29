@@ -7,8 +7,8 @@ import { extractClipboardFragment, loadPastePrefs, saveLastPasteChoice, savePast
 import { renderEditorToolbar } from './editor-toolbar.js';
 import './color-popover.js';
 import { editorStyles } from '../styles/editor.css.js';
-import { saveSelection as selSave, restoreSelection as selRestore, containsNode as selContains, closestBlock as selClosestBlock } from '../editor/selection.js';
-import { execCommand, handleShortcut, toggleCodeBlock as cmdToggleCodeBlock, setAlignment } from '../editor/commands.js';
+import { handleShortcut } from '../editor/keymap.js';
+import { PMEngine } from '../editor/pm-engine.js';
 
 type Align = 'left' | 'center' | 'right' | 'justify';
 
@@ -20,6 +20,7 @@ export class DemoRichTextEditor extends LitElement {
   @property({ type: String }) placeholder: string = 'Start typing…';
   @property({ type: Boolean, reflect: true }) disabled: boolean = false;
   @property({ type: Boolean, attribute: 'toolbar-visible' }) toolbarVisible: boolean = true;
+  // Exec engine removed; PM is the only engine
 
   @state() private _isBold = false;
   @state() private _isItalic = false;
@@ -33,17 +34,24 @@ export class DemoRichTextEditor extends LitElement {
   private _cleanupImports?: () => void;
   @state() private _colorOpen: boolean = false;
   @state() private _foreColor: string = '#000000';
-  private _savedRange: Range | null = null;
   @state() private _pastePromptOpen: boolean = false;
   @state() private _pendingPasteHtml: string = '';
   @state() private _pendingPasteText: string = '';
   @property({ type: String, attribute: 'paste-mode' }) pasteMode: 'prompt' | 'html' | 'text' = 'prompt';
   @state() private _lastPasteChoice: 'html' | 'text' = 'html';
+  @property({ type: Boolean, attribute: 'sanitize-paste' }) sanitizePaste: boolean = false;
+  @property({ type: Boolean, attribute: 'debug' }) debug: boolean = false;
 
   private _changeDebounce?: number;
   private get editable(): HTMLDivElement | null {
     return this.renderRoot?.querySelector('.content') as HTMLDivElement | null;
   }
+  private _pm: PMEngine | null = null;
+  private _pmInternalUpdate = false;
+  private _pmSavedSelection: any = null;
+  private _suppressNextValueApply = false;
+  private _selChangeTimer?: number;
+  private _log(...args: any[]) { if (this.debug) console.debug('[RTE]', ...args); }
 
   protected firstUpdated(): void {
     const editable = this.editable;
@@ -66,28 +74,34 @@ export class DemoRichTextEditor extends LitElement {
     const prefs = loadPastePrefs();
     this.pasteMode = prefs.mode;
     this._lastPasteChoice = prefs.last;
+
+    // Initialize editing engine (PM only)
+    this._initEngine();
   }
 
   connectedCallback(): void {
     super.connectedCallback();
-    document.addEventListener('selectionchange', this._handleSelectionChange, { passive: true });
   }
 
   disconnectedCallback(): void {
-    document.removeEventListener('selectionchange', this._handleSelectionChange as any);
     if (this._cleanupImports) this._cleanupImports();
+    // Tear down PM engine on disconnect to avoid leaks
+    this._teardownEngine();
+    if (this._selChangeTimer) window.clearTimeout(this._selChangeTimer);
     super.disconnectedCallback();
   }
 
   updated(changed: Map<string, unknown>) {
     if (changed.has('value')) {
-      const el = this.editable;
-      if (el && el.innerHTML !== this.value) {
-        el.innerHTML = this.value || '';
+      if (this._suppressNextValueApply) {
+        // Skip applying because setHTML() already set PM content
+        this._suppressNextValueApply = false;
+      } else if (!this._pmInternalUpdate) {
+        this._pmSetHTML(this.value || '');
       }
     }
     if (changed.has('disabled')) {
-      if (this.editable) this.editable.contentEditable = this.disabled ? 'false' : 'true';
+      this._pmSetDisabled(this.disabled);
     }
   }
 
@@ -109,7 +123,7 @@ export class DemoRichTextEditor extends LitElement {
             lastPasteChoice: this._lastPasteChoice,
           }, {
             onImport: () => this._openImportDialog(),
-            onColorButton: () => { this._saveSelection(); this._toggleColorPicker(); },
+            onColorButton: () => { this._saveSelectionPM(); this._toggleColorPicker(); },
             onColorChange: (color: string) => this._applyColor(color),
             onColorClose: () => this._closeColorPicker(),
             onPasteToggle: () => this._togglePasteMode(),
@@ -117,6 +131,7 @@ export class DemoRichTextEditor extends LitElement {
             onApplyPasteText: () => this._applyPaste('text'),
             onCancelPaste: () => this._cancelPastePrompt(),
             onSetFont: (family: string) => this.setFont(family),
+            onSaveSelection: () => { this._saveSelectionPM(); },
             onExec: (cmd: string, val?: string) => this.exec(cmd, val),
             onSetAlign: (a) => this.setAlign(a),
             onToggleCodeBlock: () => this.toggleCodeBlock(),
@@ -125,11 +140,6 @@ export class DemoRichTextEditor extends LitElement {
         <div
           class="content placeholder"
           data-placeholder=${this.placeholder}
-          contenteditable=${!this.disabled}
-          role="textbox"
-          aria-multiline="true"
-          @input=${this._onInput}
-          @blur=${this._onBlur}
           @paste=${this._onPaste}
           data-drag=${this._dragOver ? 'true' : 'false'}
         ></div>
@@ -140,7 +150,7 @@ export class DemoRichTextEditor extends LitElement {
   
 
   private _onInput = () => {
-    const html = this.editable?.innerHTML || '';
+    const html = this.getHTML();
     this.value = html;
     this.dispatchEvent(new CustomEvent('input', { detail: { html } }));
     window.clearTimeout(this._changeDebounce);
@@ -171,7 +181,7 @@ export class DemoRichTextEditor extends LitElement {
       }
       // prompt mode
       e.preventDefault();
-      this._saveSelection();
+      this._saveSelectionPM();
       this._pendingPasteHtml = frag;
       this._pendingPasteText = text;
       this._pastePromptOpen = true;
@@ -190,10 +200,14 @@ export class DemoRichTextEditor extends LitElement {
   }
 
   private _applyPaste(mode: 'html' | 'text') {
-    this._restoreSelection();
+    this._pm?.restoreSelection(this._pmSavedSelection);
     if (mode === 'html') {
       // Insert as-is (1:1) per user choice
-      this.exec('insertHTML', this._pendingPasteHtml);
+      if (this.sanitizePaste && this.pasteMode !== 'html') {
+        this._pm?.exec('insertHTMLSanitized', this._pendingPasteHtml);
+      } else {
+        this.exec('insertHTML', this._pendingPasteHtml);
+      }
     } else {
       this.exec('insertText', this._pendingPasteText);
     }
@@ -252,9 +266,7 @@ export class DemoRichTextEditor extends LitElement {
     return wrapper.innerHTML;
   }
 
-  private _saveSelection() { this._savedRange = selSave(); }
-
-  private _restoreSelection() { return selRestore(this._savedRange); }
+  private _saveSelectionPM() { this._pmSavedSelection = this._pm?.getSelection() || null; this._log('PM saveSelection', this._pmSavedSelection ? { from: this._pmSavedSelection.from, to: this._pmSavedSelection.to, empty: this._pmSavedSelection.empty } : 'null'); }
 
   private _toggleColorPicker() {
     this._colorOpen = !this._colorOpen;
@@ -265,8 +277,8 @@ export class DemoRichTextEditor extends LitElement {
   }
 
   private _applyColor(color: string) {
-    // Restore selection to apply color at the original caret
-    this._restoreSelection();
+    // Restore PM selection to apply color at the original caret
+    this._pm?.restoreSelection(this._pmSavedSelection);
     this.exec('foreColor', color);
     this._foreColor = color;
     // keep picker open for quick multiple choices
@@ -286,47 +298,24 @@ export class DemoRichTextEditor extends LitElement {
       italic: () => this.exec('italic'),
       underline: () => this.exec('underline'),
       link: () => this.promptLink(),
+      orderedList: () => this.exec('insertOrderedList'),
+      unorderedList: () => this.exec('insertUnorderedList'),
+      quote: () => this.exec('formatBlock', 'BLOCKQUOTE'),
+      heading1: () => this.exec('formatBlock', 'H1'),
+      heading2: () => this.exec('formatBlock', 'H2'),
+      paragraph: () => this.exec('formatBlock', 'P'),
     });
     if (handled) return;
   };
 
-  private _handleSelectionChange = () => {
-    // Only update if selection is inside our editor
-    const sel = document.getSelection();
-    const editable = this.editable;
-    if (!sel || !editable) return;
-    const anchorNode = sel.anchorNode;
-    if (!anchorNode) return;
-    if (selContains(editable, anchorNode)) {
-      this._updateButtonStates();
-      this.dispatchEvent(new CustomEvent('selection-change'));
-    }
-  };
-
-  // containsNode moved to selection utils
-
-  private focusEditor() {
-    const editable = this.editable;
-    if (!editable) return;
-    if (document.activeElement !== editable) {
-      editable.focus();
-      // Place cursor at end if empty
-      if (editable.innerHTML === '' || editable.innerHTML === '<br>') {
-        const range = document.createRange();
-        range.selectNodeContents(editable);
-        range.collapse(false);
-        const sel = window.getSelection();
-        sel?.removeAllRanges();
-        sel?.addRange(range);
-      }
-    }
-  }
+  private _handleSelectionChange = () => {};
 
   exec(command: string, value?: string) {
     if (this.disabled) return;
-    this.focusEditor();
-    execCommand(command, value);
-    this._onInput();
+    this._log('exec', { engine: 'pm', command, value });
+    this._pm?.focus();
+    this._pm?.exec(command, value as any);
+    // PM onUpdate will emit input/change for this transaction
   }
 
   private _openImportDialog() {
@@ -366,7 +355,7 @@ export class DemoRichTextEditor extends LitElement {
         this.exec('insertHTML', html);
       }
     }
-    this._onInput();
+    // PM onUpdate will emit input/change after inserts
   }
 
   
@@ -384,12 +373,12 @@ export class DemoRichTextEditor extends LitElement {
   }
 
   toggleCodeBlock() {
-    cmdToggleCodeBlock(this.editable);
-    this._onInput();
+    this._pm?.exec('formatBlock', 'PRE');
+    // PM onUpdate will emit input/change
   }
 
   setAlign(alignment: Align) {
-    setAlignment(alignment);
+    this._pm?.exec('setAlign', alignment as any);
     this._align = alignment;
   }
 
@@ -401,40 +390,10 @@ export class DemoRichTextEditor extends LitElement {
     this.exec('formatBlock', 'P');
   }
 
-  // closestBlock moved to selection utils
+  
 
   private _updateButtonStates() {
-    try {
-      this._isBold = document.queryCommandState('bold');
-      this._isItalic = document.queryCommandState('italic');
-      this._isUnderline = document.queryCommandState('underline');
-      this._isStrike = document.queryCommandState('strikeThrough');
-      // Font family state (robust)
-      let fam = this.normalizeFontName((document.queryCommandValue('fontName') as string | null) || '');
-      if (!fam) {
-        const node = document.getSelection()?.anchorNode ?? null;
-        const el = (node instanceof Element ? node : (node as Node | null)?.parentElement) as Element | null;
-        const ff = el ? getComputedStyle(el).fontFamily || '' : '';
-        fam = this.parseFirstFontFamily(ff);
-      }
-      this._fontFamily = this.canonicalFontName(fam) || 'Arial';
-      // Foreground color state
-      let col = (document.queryCommandValue('foreColor') as string | null) || '';
-      if (col) {
-        this._foreColor = this._normalizeColor(col) || this._foreColor;
-      }
-      // Alignment state is not consistently reported; keep last user selection
-      // Optionally, we can inspect closest block's text-align
-      const block = selClosestBlock(this.editable, document.getSelection()?.anchorNode ?? null);
-      if (block) {
-        const ta = (block.style.textAlign || getComputedStyle(block).textAlign || 'left') as Align;
-        if (['left', 'center', 'right', 'justify'].includes(ta)) {
-          this._align = ta as Align;
-        }
-      }
-    } catch {
-      // ignore for demo
-    }
+    return; // PM engine updates flags via callback
   }
 
   private _normalizeColor(input: string): string {
@@ -500,6 +459,10 @@ export class DemoRichTextEditor extends LitElement {
 
   setFont(family: string) {
     if (!family) return;
+    // Restore saved selection to apply to intended range (PM)
+    // Restore selection to apply at intended range
+    this._pm?.restoreSelection(this._pmSavedSelection);
+    if (family === '__default') { this.exec('fontName', '__default'); this._fontFamily = 'Arial'; return; }
     this.exec('fontName', family);
     this._fontFamily = this.canonicalFontName(family) || 'Arial';
   }
@@ -513,18 +476,66 @@ export class DemoRichTextEditor extends LitElement {
   }
 
   // Public API
-  getHTML(): string {
-    return this.editable?.innerHTML ?? '';
-  }
+  getHTML(): string { return this._pm?.getHTML() ?? ''; }
 
   setHTML(html: string) {
-    if (this.editable) {
-      this.editable.innerHTML = html;
+    // Avoid double-apply: updated() also reacts to value changes
+    this._suppressNextValueApply = true;
+    this.value = html;
+    this._pmSetHTML(html);
+  }
+
+  private _initEngine() {
+    const el = this.editable;
+    if (!el) return;
+    el.innerHTML = '';
+    this._pm = new PMEngine(el, (html) => {
+      // Sync value and emit events on PM updates (typing, commands, history)
+      this._pmInternalUpdate = true;
       this.value = html;
-      this._onInput();
-    } else {
-      this.value = html;
+      // Mirror input/change behavior here so external listeners work during typing
+      this.dispatchEvent(new CustomEvent('input', { detail: { html } }));
+      window.clearTimeout(this._changeDebounce);
+      this._changeDebounce = window.setTimeout(() => {
+        this.dispatchEvent(new CustomEvent('change', { detail: { html: this.value } }));
+      }, 300);
+      Promise.resolve().then(() => { this._pmInternalUpdate = false; });
+    }, (flags) => {
+      this._isBold = flags.bold;
+      this._isItalic = flags.italic;
+      this._isUnderline = flags.underline;
+      this._isStrike = flags.strike;
+      this._align = flags.align;
+      this._foreColor = flags.foreColor || this._foreColor;
+      if (flags.fontFamily) this._fontFamily = this.canonicalFontName(flags.fontFamily) || flags.fontFamily;
+      // Throttle selection-change events with payload to avoid floods during drags
+      const sel = this._pm?.getSelection();
+      const detail = sel ? { from: sel.from, to: sel.to, empty: sel.empty } : { from: 0, to: 0, empty: true };
+      if (this._selChangeTimer) window.clearTimeout(this._selChangeTimer);
+      this._selChangeTimer = window.setTimeout(() => {
+        this.dispatchEvent(new CustomEvent('selection-change', { detail }));
+      }, 75);
+    });
+    this._pmSetDisabled(this.disabled);
+    if (this.value) this._pmSetHTML(this.value);
+    // Ensure focus so typing works immediately after switching engine
+    setTimeout(() => this._pm?.focus(), 0);
+  }
+
+  private _teardownEngine() {
+    if (this._pm) {
+      this._pm.destroy();
+      this._pm = null;
     }
+    
+  }
+
+  private _pmSetHTML(html: string) {
+    this._pm?.setHTML(html);
+  }
+
+  private _pmSetDisabled(disabled: boolean) {
+    this._pm?.setDisabled(disabled);
   }
 }
 

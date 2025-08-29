@@ -1,210 +1,393 @@
- # HtmlEdit – Developer Notes
- 
- This document explains the structure and design of the HtmlEdit demo editor. It covers the individual components, utilities, and how they fit together, with guidance on extending, testing, and maintaining the codebase.
- 
- ## Overview
- 
- - Web component: `<demo-rich-text-editor>` built with Lit + TypeScript.
- - Goals: Quill-like basics without heavy deps; simple API; clear modular design.
- - Key features:
-   - Basic formatting: bold/italic/underline/strike, headings, lists, blockquote, code.
-   - Links (create/unlink), text alignment, clear formatting, undo/redo.
-   - Font family selector; text color popover.
-   - Paste modes: Prompt / HTML 1:1 / Plain text; remembers last choice.
-   - Import at caret: images (as data URLs) and RTF (best-effort to HTML).
-   - Drag-and-drop for imports; placeholder; ARIA roles; keyboard shortcuts.
- 
- ## Project Layout
- 
- - `src/components/rich-text-editor.ts`: Main Lit component (composition, state, wiring)
- - `src/components/editor-toolbar.ts`: Toolbar template renderer (pure view + callbacks)
- - `src/components/color-popover.ts`: Lightweight color picker popover component
- - `src/editor/paste.ts`: Paste fragment extraction and paste-mode preference helpers
- - `src/editor/selection.ts`: Selection/caret helpers (save/restore, containment, block lookup)
- - `src/editor/commands.ts`: `execCommand` wrapper, alignment mapping, shortcut handling, code toggle
- - `src/styles/editor.css.ts`: Editor styles (exported `editorStyles`)
- - `src/utils/import-image.ts`: Read image file → Data URL
- - `src/utils/import-rtf.ts`: Convert `.rtf` text → very simple HTML
- - `src/utils/import-wiring.ts`: Hidden file input + drag-and-drop wiring helpers
- - `src/index.ts`: Demo entry – mounts the component and logs change events
- - `index.html`: Demo page (import map + loads `dist/index.js`)
- - `server.cjs`: Tiny static server for preview
- - `test/*`: Node-based unit tests for paste and commands
- 
- ## Build & Run
- 
- - Build: `npm run build` (TypeScript → `dist/` ESM)
- - Preview: `npm run preview` (build + static server on http://localhost:5173)
- - Dev: `npm run dev` (watch) + `npm start` (server) in two terminals
- - Tests: `npm test` (build, then Node tests)
- 
- ## Public API (Component)
- 
- - Tag: `<demo-rich-text-editor>`
- - Attributes/Properties:
-   - `value: string` – HTML content (two-way via events; internal source of truth is contenteditable)
-   - `placeholder: string` – Placeholder text when empty
-   - `disabled: boolean` – Disables editing and toolbar actions
-   - `paste-mode: 'prompt' | 'html' | 'text'` – Paste behavior (also persisted in localStorage)
-   - `toolbar-visible: boolean` – Show/hide toolbar
- - Methods:
-   - `getHTML(): string` – Returns current HTML from the editable
-   - `setHTML(html: string)` – Sets content and synchronizes `value`
- - Events:
-   - `input`: fires on every change `{ detail: { html } }`
-   - `change`: debounced `{ detail: { html } }`
-   - `selection-change`: fires on caret selection changes within editor
- 
- ## Main Component – `rich-text-editor.ts`
- 
- Responsibilities:
- - Owns the shadow DOM: wrapper, toolbar (via template helper), contenteditable div.
- - Maintains editor state: formatting toggles, alignment hint, font family, foreColor, paste UI, drag state.
- - Coordinates modules:
-   - Toolbar view (`renderEditorToolbar`) with handlers → component `exec`, `setAlign`, `setFont`, paste actions.
-   - Paste utils → fragment extraction, prefs load/save; prompt flow and last-choice memory.
-   - Selection utils → save/restore caret; containment checks; closest block.
-   - Commands → `execCommand` wrapper; alignment mapping; toggling code block; shortcuts.
-   - Import wiring → hidden input + DnD; import readers (image/RTF) → insert at caret.
- - Keyboard shortcuts: handled via `handleShortcut` (Ctrl/Cmd+B/I/U/K).
- - Value synchronization:
-   - `updated()` applies `value` to the editable when external changes occur.
-   - `contenteditable` emits `input` → updates `value`, debounces `change`.
- 
- Key DOM elements:
- - `.editor`: container
- - `.toolbar`: toolbar region (from `editor-toolbar.ts`)
- - `.content`: `contenteditable` div (source of truth)
- 
- Important flows:
- - Exec command: `exec(name, value?)` focuses editable, calls `execCommand`, emits input.
- - Paste:
-   - Reads clipboard `text/html` and `text/plain`.
-   - If `paste-mode==='html'`: insert extracted fragment exactly.
-   - If `paste-mode==='text'`: insert plain text.
-   - If `paste-mode==='prompt'`: shows inline prompt (remembers last choice) and applies on selection.
- - Import:
-   - Toolbar Import opens hidden input (or ephemeral fallback) → `importFiles()`.
-   - Drag-and-drop attaches to the editable and sets a visual drag state.
- 
- ## Toolbar – `editor-toolbar.ts`
- 
- - Exports `renderEditorToolbar(props, handlers)` returning a Lit template only (no internal state).
- - Props summarize component state used for rendering (format toggles, fonts, paste mode/prompt state).
- - Handlers are callbacks provided by the main component.
- - Contains buttons for formatting, headings, lists, quotes, code, links, alignment, undo/redo, clear.
- - Integrates `<color-popover>` and the paste prompt UI.
- - Font family `<select>` uses `.value=` binding; color button reflects `foreColor`.
- - Paste mode toggle button cycles Prompt → HTML 1:1 → Plain.
- 
- ## Color Popover – `color-popover.ts`
- 
- - Minimal popover with an `<input type=color>` and swatches.
- - Props:
-   - `open: boolean` – whether to render the popover
-   - `value: string` – current color (hex string)
- - Events (bubbled + composed):
-   - `color-change` with `{ color }`
-   - `color-close`
- 
- ## Paste Utilities – `editor/paste.ts`
- 
- - `extractClipboardFragment(html: string): string`
-   - If `<!--StartFragment-->…<!--EndFragment-->` present, returns exact substring.
-   - Otherwise parses `text/html` and returns `body.innerHTML` (falls back to raw input if parsing is unavailable).
- - Preferences (localStorage-backed):
-   - `loadPastePrefs()` → `{ mode: 'prompt'|'html'|'text', last: 'html'|'text' }`
-   - `savePasteMode(mode)`, `saveLastPasteChoice(choice)`
- 
- ## Selection Utilities – `editor/selection.ts`
- 
- - `saveSelection(): Range|null`, `restoreSelection(range): boolean`
- - `containsNode(root: Node, node: Node): boolean` – checks if selection anchor is inside editable
- - `closestBlock(editable, node): HTMLElement|null` – finds the closest block element
- 
- ## Commands – `editor/commands.ts`
- 
- - `execCommand(command, value?)`: safe wrapper for `document.execCommand`.
- - `setAlignment(align)`: maps `'left'|'center'|'right'|'justify'` to proper exec calls.
- - `handleShortcut(e, actions)`: handles Ctrl/Cmd+B/I/U/K and calls provided actions.
- - `toggleCodeBlock(editable)`: toggles wrapping of the current block in `<pre>`.
- 
- ## Styles – `styles/editor.css.ts`
- 
- - Centralized CSS exported as `editorStyles` and applied by the component.
- - Includes toolbar layout, contenteditable area, placeholder, and basic content styling.
- 
- ## Import Helpers
- 
- - `utils/import-image.ts`:
-   - `readImageFileAsDataURL(file)`: Promise<string> – reads images as data URLs for insertion.
- - `utils/import-rtf.ts`:
-   - `rtfToHtml(rtf)` and `readRtfFileAsHtml(file)`
-   - Naive conversion: decodes `\uNNNN?`, replaces `\par`, strips control words/groups; preserves text only.
- - `utils/import-wiring.ts`:
-   - `setupHiddenFileInput(root, { accept, multiple, onFiles })`: returns `{ open, cleanup }`
-   - `attachDragAndDrop(target, { onFiles, onDragState })`: returns cleanup function
- 
- ## Demo Entrypoints
- 
- - `src/index.ts`: Simple demo – mounts the editor and logs `change` events.
- - `index.html`: Import map for `lit` (CDN) + loads `./dist/index.js`.
- - `server.cjs`: Barebones static server for preview (serves `/index.html` and `/dist/*`).
- 
- ## Testing
- 
- - `npm test` builds and runs Node test scripts (no external test framework required):
-   - `test/paste.test.js` – tests clipboard fragment extraction and prefs (mocks `localStorage`).
-   - `test/commands.test.js` – tests alignment mapping, exec wrapper, and shortcuts (mocks `document.execCommand`).
- - Extending tests:
-   - Add jsdom for DOM-level tests (e.g., selection.closestBlock or code toggle).
-   - Keep unit tests fast and deterministic by mocking browser globals.
- 
- ## Extending the Editor
- 
- - Add a toolbar button:
-   1. Add a handler in `rich-text-editor.ts` (or reuse `exec`).
-   2. Wire a button in `editor-toolbar.ts` (call the handler).
-   3. Update `handleShortcut` in `editor/commands.ts` if adding a shortcut.
- - Add background (highlight) color:
-   - Create another popover or reuse `color-popover` with a separate state (e.g., `_backColor`).
-   - Apply via `exec('backColor', color)` (browser support varies).
- - Add font size selector:
-   - Toolbar `<select>` mapping to `exec('fontSize', <1..7>)` or inline style spans (custom implementation recommended for consistency).
- - Improve RTF/HTML import:
-   - Integrate a robust converter or sanitization (e.g., DOMPurify) with allowlists.
- - Persistence:
-   - Expose `value` as attribute and support external storage; debounce `change` event is already in place.
- 
- ## Accessibility & UX
- 
- - Toolbar uses `role="toolbar"` and `aria-pressed` for toggle state.
- - Color/popover uses simple focus/close. Consider focus trapping and keyboard support for advanced use.
- - Placeholder uses `:empty::before` pattern inside the editable.
- 
- ## Security Notes
- 
- - HTML 1:1 paste intentionally skips sanitization (per feature request). For production, enable sanitization.
- - Basic paste sanitization utility exists (but is not used in 1:1 mode).
- 
- ## Browser Notes
- 
- - Uses `document.execCommand` (deprecated but widely supported). For production-grade editors, consider a more modern model (e.g., ProseMirror or ContentEditable+ custom ranges).
- 
- ## CI
- 
- - `.github/workflows/ci.yml` runs `npm ci` and `npm test` on push/PR.
- 
- ## Coding Conventions
- 
- - Keep components thin; push logic to `editor/*` utilities and view to `components/*`.
- - Avoid mutating the editable via Lit; the component manages `innerHTML` directly.
- - Keep toolbar purely presentational and drive it via props/handlers.
- 
- ## Known Limitations / TODO
- 
- - Minimal RTF conversion; formatting is not preserved.
- - No image editing UI (by design); import-only at caret.
- - No background color picker; no font size selector (easy to add).
- - Sanitization is minimal and off for 1:1 paste; integrate a sanitizer for production.
- 
+# HtmlEdit – Developer Notes
+
+This document explains the internals of the demo rich text editor and how we use ProseMirror as the editing engine. It includes implementation notes, extension points, and code snippets for common tasks.
+
+## Architecture Overview
+
+- Web Component: `<demo-rich-text-editor>` (Lit + TypeScript)
+- Engine: ProseMirror (PM) only — no `document.execCommand`
+- Composition:
+  - Component manages the shadow DOM, toolbar wiring, paste/import flows, and event emission
+  - `PMEngine` wraps ProseMirror state/view, schema, and command mapping for an editor-friendly API
+  - Toolbar is a pure view renderer that calls back into the component
+
+Key files:
+- `src/components/rich-text-editor.ts` – component logic, events, toolbar wiring
+- `src/editor/pm-engine.ts` – PM schema, view, commands, and helpers
+- `src/styles/editor.css.ts` – editor styles (includes minimal PM styles)
+- `src/editor/keymap.ts` – keyboard shortcuts helper
+- `src/editor/paste.ts` – paste fragment extraction (Start/EndFragment) + prefs
+- `src/utils/*` – import helpers (image/RTF) + input/DnD wiring
+
+## ProseMirror Engine
+
+`PMEngine` encapsulates:
+- Schema: extends `prosemirror-schema-basic` with:
+  - Marks: `underline`, `strike`, `color` (style `color:`), `font` (style `font-family:`)
+  - Nodes: block alignment attribute (`textAlign`) on `paragraph` and `heading`
+  - Lists via `prosemirror-schema-list`
+- View/State: `EditorView`, `EditorState`, history, drop/gap cursor, keymaps
+- onUpdate: called on every state update to provide serialized HTML to the component
+- onState: exposes formatting flags and selection-derived state (bold/italic/underline/strike, align, foreColor, fontFamily)
+
+### Command Mapping
+
+`PMEngine.exec(name, value?)` supports:
+- Inline: `bold`, `italic`, `underline`, `strikeThrough`
+- Blocks: `formatBlock` with `H1`/`H2`/`BLOCKQUOTE`/`PRE`/`P`
+- Lists: `insertOrderedList`, `insertUnorderedList`
+- Links: `createLink`, `unlink`
+- Marks: `foreColor` (color mark), `fontName` (font mark)
+- Alignment: `setAlign` with `'left'|'center'|'right'|'justify'`
+- Content: `insertHTML`, `insertHTMLSanitized`, `insertText`, `insertImage`
+- History: `undo`, `redo`
+- Clear: `removeFormat` (clears strong/em/underline/strike/link/code/color/font)
+
+Caret behavior: For `fontName`/`foreColor` at an empty selection, we adjust stored marks so newly typed text adopts the change.
+
+### Schema Serialization
+
+`PMEngine.getHTML()` serializes the current doc using `DOMSerializer.fromSchema(schema)`, so content reflects PM’s model (marks/nodes) in HTML.
+
+## Component Event Model
+
+- The component subscribes to PM updates and emits:
+  - `input`: for each PM transaction with `{ html }`
+  - `change`: debounced ~300ms after the last input with `{ html }`
+  - `selection-change`: throttled ~75ms with `{ from, to, empty }`
+- All events originate from PM updates to avoid duplicates.
+
+### Listening to events
+
+```ts
+const editor = document.querySelector('demo-rich-text-editor') as HTMLElement;
+
+// Input: fires on every PM transaction
+editor.addEventListener('input', (e: Event) => {
+  const { html } = (e as CustomEvent<{ html: string }>).detail;
+  console.log('input html length:', html.length);
+});
+
+// Change: debounced (~300ms) after last input
+editor.addEventListener('change', (e: Event) => {
+  const { html } = (e as CustomEvent<{ html: string }>).detail;
+  console.log('change html:', html);
+});
+
+// Selection changes: throttled (~75ms)
+editor.addEventListener('selection-change', (e: Event) => {
+  const sel = (e as CustomEvent<{ from: number; to: number; empty: boolean }>).detail;
+  console.log('selection:', sel.from, sel.to, sel.empty);
+});
+```
+
+### Invoking commands
+
+```ts
+const editor = document.querySelector('demo-rich-text-editor') as any;
+
+// Inline formatting
+editor.exec('bold');
+editor.exec('italic');
+editor.exec('underline');
+editor.exec('strikeThrough');
+
+// Blocks
+editor.exec('formatBlock', 'H1');
+editor.exec('formatBlock', 'BLOCKQUOTE');
+editor.exec('formatBlock', 'PRE'); // code block
+
+// Lists
+editor.exec('insertOrderedList');
+editor.exec('insertUnorderedList');
+
+// Links
+editor.exec('createLink', 'https://example.com');
+editor.exec('unlink');
+
+// Alignment
+editor.exec('setAlign', 'center');
+
+// Font & color (marks)
+editor.exec('fontName', 'Georgia');
+editor.exec('foreColor', '#ff0066');
+editor.exec('fontName', '__default'); // clear custom font family
+
+// Insert content
+editor.exec('insertText', 'Hello world');
+editor.exec('insertHTML', '<strong>Raw HTML</strong>');
+editor.exec('insertImage', 'data:image/png;base64,...');
+
+// History
+editor.exec('undo');
+editor.exec('redo');
+
+// Clear inline marks + reset block to paragraph
+editor.exec('removeFormat');
+editor.exec('formatBlock', 'P');
+```
+
+### Programmatic HTML
+
+```ts
+const editor = document.querySelector('demo-rich-text-editor') as any;
+editor.setHTML('<p>Start from here</p>');
+console.log(editor.getHTML());
+```
+
+## Paste Flow & Sanitization
+
+Paste modes:
+- `html`: insert exact HTML (1:1) using Start/EndFragment if present
+- `text`: insert as text
+- `prompt`: UI asks per paste (remembers last choice)
+
+Sanitization policy:
+- If `sanitize-paste` attribute is present, HTML insertion is sanitized unless `paste-mode === 'html'` (true 1:1).
+- Plain text insertion is unaffected.
+
+## Styling
+
+`src/styles/editor.css.ts` provides minimal styles:
+- Editor container and toolbar
+- `.content` host div with padding and min-height
+- ProseMirror-specific rules:
+  - `.ProseMirror { white-space: pre-wrap; word-wrap: break-word; outline: none; }`
+  - Paragraph/list margins
+  - `.ProseMirror img { max-width: 100%; height: auto; }` to keep images responsive
+
+## Debugging
+
+- Demo supports a URL flag to enable debug aids:
+  - `?rteDebug` or `?debug=1` or `?debug=true`
+  - Enables verbose logs (`editor.debug = true`) and an on-page HUD for counts of `input`, `change`, and `selection-change` events (exposes `window.__rteHud.reset()`).
+
+## Setup & Installation
+
+Prerequisites:
+- Node.js 18+ and npm 9+
+
+Install and run (in this repo):
+- Install deps: `npm install`
+- Dev server (hot reload): `npm run dev` → http://localhost:5173
+- Build: `npm run build` → emits to `dist/`
+- Preview built output: `npm run preview` → http://localhost:4173
+
+Integrating into another project:
+- Add dependencies (ProseMirror core + list schema) and Vite if you need a dev server:
+  - `npm i lit prosemirror-model prosemirror-state prosemirror-view prosemirror-commands prosemirror-history prosemirror-keymap prosemirror-schema-basic prosemirror-schema-list prosemirror-dropcursor prosemirror-gapcursor`
+  - `npm i -D vite typescript`
+- Copy or adapt:
+  - Component: `src/components/rich-text-editor.ts`
+  - PM engine: `src/editor/pm-engine.ts`
+  - Styles: `src/styles/editor.css.ts`
+  - Optional helpers: `src/editor/keymap.ts`, `src/editor/paste.ts`, `src/utils/*`
+- Ensure your bundler handles ESM and TypeScript. With Vite, set `type: module` in `package.json` (already set here) and run `vite`.
+
+### Minimal config snippets (for consumers)
+
+`package.json` (important fields)
+```json
+{
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  }
+}
+```
+
+`tsconfig.json`
+```json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ES2020",
+    "moduleResolution": "bundler",
+    "lib": ["ES2020", "DOM"],
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "outDir": "dist",
+    "experimentalDecorators": true,
+    "useDefineForClassFields": false
+  },
+  "include": ["src"]
+}
+```
+
+`vite.config.ts`
+```ts
+import { defineConfig } from 'vite';
+
+export default defineConfig({
+  server: {
+    port: 5173,
+    open: true,
+    host: true,
+  },
+  build: {
+    outDir: 'dist',
+    sourcemap: true,
+    target: 'es2020',
+  },
+});
+```
+
+`src/index.ts` (example entry)
+```ts
+import './components/rich-text-editor.ts';
+
+const editor = document.createElement('demo-rich-text-editor');
+editor.value = '<p>Hello <strong>world</strong>!</p>';
+document.body.appendChild(editor);
+```
+
+`index.html`
+```html
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Editor Demo</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/index.ts"></script>
+  </body>
+  </html>
+```
+
+## Extending the PM Schema
+
+- To add a new mark (e.g., background highlight), extend the marks spec in `createSchema()` inside `pm-engine.ts`, then map a command in `exec()` and render UI in the toolbar.
+- For new block attributes, mirror the `textAlign` pattern: include in `attrs`, adjust parseDOM/toDOM, and set via a command that updates node markup in a selection range.
+
+## Testing Notes
+
+- Most behaviors are driven by PM transactions, so event testing focuses on emitted events from the component and HTML serialization.
+- For paste handling, unit tests can validate fragment extraction; for HTML sanitization, consider DOMPurify in production.
+
+## Publishing as a Library
+
+You can ship the component as a library using Vite’s library mode.
+
+### Option A: ESM-only (recommended)
+
+`vite.lib.config.ts`
+```ts
+import { defineConfig } from 'vite';
+import path from 'node:path';
+
+export default defineConfig({
+  build: {
+    lib: {
+      entry: path.resolve(__dirname, 'src/components/rich-text-editor.ts'),
+      name: 'HtmlEdit',
+      fileName: (format) => `html-edit.${format}.js`,
+      formats: ['es'],
+    },
+    rollupOptions: {
+      // Externalize big deps so consumers control versions
+      external: [/^lit/, /^prosemirror-/],
+    },
+    target: 'es2020',
+    sourcemap: true,
+    outDir: 'dist',
+    emptyOutDir: false,
+  },
+});
+```
+
+`package.json` (library-relevant fields)
+```json
+{
+  "name": "html-edit",
+  "version": "0.0.1",
+  "type": "module",
+  "files": ["dist"],
+  "exports": {
+    ".": {
+      "import": "./dist/html-edit.es.js"
+    }
+  },
+  "scripts": {
+    "build:lib": "vite build -c vite.lib.config.ts"
+  },
+  "peerDependencies": {
+    "lit": ">=3",
+    "prosemirror-model": ">=1",
+    "prosemirror-state": ">=1",
+    "prosemirror-view": ">=1"
+  }
+}
+```
+
+Optional type declarations (basic):
+- Generate `.d.ts` with a separate command if you want to publish types.
+
+`scripts` entry (adds a types build):
+```json
+{
+  "types": "tsc --emitDeclarationOnly --declaration --outDir dist"
+}
+```
+Run `npm run types` before `npm publish` and reference with `"types": "./dist/index.d.ts"` in `package.json` if needed.
+
+### Option B: ESM + UMD
+
+Adding UMD requires declaring globals or bundling dependencies. Prefer ESM if possible. If you still want UMD:
+
+`vite.lib.config.ts` (UMD + ES)
+```ts
+import { defineConfig } from 'vite';
+import path from 'node:path';
+
+export default defineConfig({
+  build: {
+    lib: {
+      entry: path.resolve(__dirname, 'src/components/rich-text-editor.ts'),
+      name: 'HtmlEdit',
+      fileName: (format) => `html-edit.${format}.js`,
+      formats: ['es', 'umd'],
+    },
+    rollupOptions: {
+      external: [/^lit/, /^prosemirror-/],
+      output: {
+        globals: {
+          lit: 'lit',
+          'prosemirror-model': 'prosemirrorModel',
+          'prosemirror-state': 'prosemirrorState',
+          'prosemirror-view': 'prosemirrorView'
+        }
+      }
+    },
+    target: 'es2020',
+    sourcemap: true,
+    outDir: 'dist',
+    emptyOutDir: false,
+  },
+});
+```
+
+Note: Consumers must provide those globals in UMD scenarios (e.g., via script tags). ESM remains the simplest and most robust distribution.
+
+### Usage (consumer)
+
+```ts
+// ESM
+import 'html-edit/html-edit.es.js';
+
+const el = document.createElement('demo-rich-text-editor');
+el.value = '<p>Hello!</p>';
+document.body.appendChild(el);
+```
+
+### Publish
+
+1) Ensure `name`, `version`, `license`, and `repository` fields are set in `package.json`.
+2) Build: `npm run build:lib` (and `npm run types` if publishing types).
+3) Publish: `npm publish --access public` (or your scoped access policy).

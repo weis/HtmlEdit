@@ -53,6 +53,19 @@ export const editorStyles = css`
     outline: none;
     font-family: Arial, Helvetica, sans-serif; /* default editor content font */
   }
+  /* ProseMirror minimal styles inside shadow DOM */
+  .ProseMirror {
+    white-space: pre-wrap; /* satisfy PM expectation */
+    word-wrap: break-word;
+    outline: none;
+  }
+  .ProseMirror p { margin: 0.5em 0; }
+  .ProseMirror ul, .ProseMirror ol { padding-left: 1.5em; }
+  .ProseMirror img {
+    max-width: 100%;
+    height: auto;
+    display: inline-block;
+  }
   .content img { max-width: 100%; height: auto; }
   .content[data-drag="true"] {
     outline: 2px dashed #6366f1;
@@ -83,4 +96,3 @@ export const editorStyles = css`
   }
   .content a { color: #2563eb; text-decoration: underline; }
 `;
-

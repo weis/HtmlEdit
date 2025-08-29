@@ -25,6 +25,7 @@ export interface Handlers {
   onApplyPasteText: () => void;
   onCancelPaste: () => void;
   onSetFont: (family: string) => void;
+  onSaveSelection: () => void;
   onExec: (command: string, value?: string) => void;
   onSetAlign: (align: Align) => void;
   onToggleCodeBlock: () => void;
@@ -70,8 +71,13 @@ export function renderEditorToolbar(p: ToolbarProps, h: Handlers): TemplateResul
         Paste: ${p.pasteMode === 'prompt' ? 'Prompt' : p.pasteMode === 'html' ? 'HTML 1:1' : 'Plain text'}
       </button>
       <div class="sep" role="separator"></div>
-      <select aria-label="Font family" ?disabled=${p.disabled} .value=${p.fontFamily || ''} @change=${(e: Event) => h.onSetFont((e.target as HTMLSelectElement).value)}>
+      <select aria-label="Font family" ?disabled=${p.disabled}
+        .value=${p.fontFamily || ''}
+        @mousedown=${() => h.onSaveSelection()}
+        @focus=${() => h.onSaveSelection()}
+        @change=${(e: Event) => h.onSetFont((e.target as HTMLSelectElement).value)}>
         <option value="" disabled>Font</option>
+        <option value="__default" style="font-family: Arial, Helvetica, sans-serif">Default (Arial)</option>
         ${fonts.map(f => html`<option value=${f.value} style="font-family:${f.css}">${f.label}</option>`)}
       </select>
       <div class="sep" role="separator"></div>
@@ -118,4 +124,3 @@ export function renderEditorToolbar(p: ToolbarProps, h: Handlers): TemplateResul
     </div>
   `;
 }
-
